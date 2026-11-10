@@ -51,3 +51,14 @@ https://www.last.fm/api/account/create
 open nexa, go to plugins, paste a file in, turn it on.
 
 mass-accounts holds the account list the others read, so load it before the rest.
+
+## install from a link
+
+nexa can also install a plugin straight from a url. open the plugin box, pick the option to add one from a link, and paste one of these:
+
+- https://raw.githubusercontent.com/9ssault/nexa-plugins/main/mass-accounts.min.js
+- https://raw.githubusercontent.com/9ssault/nexa-plugins/main/toolbox.js
+- https://raw.githubusercontent.com/9ssault/nexa-plugins/main/say.js
+- https://raw.githubusercontent.com/9ssault/nexa-plugins/main/rpc-presence-rotation.js
+
+use the link for mass-accounts, it is a little past what the paste box takes. the other three install fine either way.
