@@ -43,6 +43,9 @@ it reads the account list that mass-accounts saves, so load mass-accounts first.
 
 shows a rich presence on your profile and rotates it over time. has last.fm support, so it can show the song you are listening to.
 
+create an application, copy the key and paste it in the field needing it, only reads your scrobbles and is never sent anywhere.
+https://www.last.fm/api/account/create
+
 ## how to use
 
 open nexa, go to plugins, paste a file in, turn it on.
