@@ -18,6 +18,14 @@ const GRACE_MIN = 500;
 const GRACE_MAX = 30000;
 const PING_TIMEOUT = 90000;
 const CONNECT_TIMEOUT = 15000;
+const HUB_PORT_DEF = 8787;
+const HUB_PORT_MIN = 1024;
+const HUB_PORT_MAX = 65535;
+const HUB_PING = 20000;
+const HUB_PONG = 9000;
+const HUB_RESYNC = 3000;
+const HUB_RETRY_MIN = 3000;
+const HUB_RETRY_MAX = 30000;
 
 const S = {
   api: null,
@@ -49,6 +57,19 @@ const S = {
   end: 0,
   next: null,
   known: false,
+  hubOn: true,
+  hub: {
+    ws: null,
+    state: "idle",
+    status: null,
+    tries: 0,
+    at: 0,
+    pingAt: 0,
+    pongAt: 0,
+    syncSig: "",
+    syncAt: 0,
+    ready: false,
+  },
 };
 
 function ls(k, d) {
@@ -76,7 +97,16 @@ function cfg() {
     max: sNum("max", MAX_DEF, MAX_MIN, MAX_MAX),
     hb: sNum("hb", HB_DEF, HB_MIN, HB_MAX),
     grace: sNum("grace", GRACE_DEF, GRACE_MIN, GRACE_MAX),
+    port: sNum("hubport", HUB_PORT_DEF, HUB_PORT_MIN, HUB_PORT_MAX),
   };
+}
+
+function readHub() {
+  try {
+    const v = S.api?.settings?.get?.("hub");
+    if (typeof v === "boolean") return v;
+  } catch {}
+  return ls("ec.so.hub", "1") !== "0";
 }
 
 function readOn() {
@@ -193,6 +223,173 @@ function send(ws, obj) {
     return true;
   } catch {
     return false;
+  }
+}
+
+// --- the local hub ---------------------------------------------------------
+// the hub is a small process on this machine that holds every account socket
+// outside the browser. when it is running the plugin only keeps this control
+// socket open. when it is not, the plugin falls back to the old behaviour and
+// keeps the accounts online inside the browser.
+
+function hubActive() {
+  return S.on && !S.stop && S.hubOn && S.hub.ready && S.hub.state === "open";
+}
+
+function hubUrl() {
+  return "wss://localhost:" + cfg().port + "/";
+}
+
+function hubSend(obj) {
+  const ws = S.hub.ws;
+  if (!ws || ws.readyState !== 1) return false;
+  try {
+    ws.send(JSON.stringify(obj));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function hubSig(cur, list) {
+  let h = 2166136261;
+  const mix = (s) => {
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+  };
+  mix(cur || "");
+  for (const a of list) {
+    mix(a.id);
+    mix(a.token);
+  }
+  return (h >>> 0).toString(36) + ":" + list.length;
+}
+
+function hubSync(force) {
+  if (!hubActive()) return;
+  const now = Date.now();
+  if (!force && now - S.hub.syncAt < HUB_RESYNC) return;
+  S.hub.syncAt = now;
+  const list = readAccounts();
+  const cur = curId();
+  const sig = hubSig(cur, list);
+  if (!force && sig === S.hub.syncSig) return;
+  S.hub.syncSig = sig;
+  const rows = list.map((a) => ({ id: a.id, token: a.token, name: a.display_name || a.username || a.id }));
+  hubSend({ op: "sync", on: true, current: cur || null, accounts: rows });
+}
+
+function hubRetry() {
+  const h = S.hub;
+  h.tries += 1;
+  const wait = Math.min(HUB_RETRY_MAX, HUB_RETRY_MIN * Math.pow(1.5, Math.min(h.tries, 6))) + Math.floor(Math.random() * 1000);
+  h.at = Date.now() + wait;
+  h.state = "absent";
+  h.ready = false;
+  h.status = null;
+  h.ws = null;
+  h.syncSig = "";
+  h.pingAt = 0;
+  h.pongAt = 0;
+  S.dirty = true;
+}
+
+function hubConnect() {
+  const h = S.hub;
+  if (!S.on || S.stop || !S.hubOn || h.ws) return;
+  if (h.at && Date.now() < h.at) return;
+  let ws;
+  try {
+    ws = new WebSocket(hubUrl());
+  } catch {
+    hubRetry();
+    return;
+  }
+  h.ws = ws;
+  h.state = "connecting";
+  h.syncSig = "";
+  S.dirty = true;
+
+  ws.addEventListener("open", () => {
+    if (h.ws !== ws) return;
+    h.state = "connecting";
+    h.ready = false;
+    h.pongAt = Date.now();
+    h.pingAt = Date.now();
+    S.dirty = true;
+  });
+
+  ws.addEventListener("message", (ev) => {
+    if (h.ws !== ws) return;
+    const raw = ev && ev.data;
+    if (typeof raw !== "string" || raw.length > 65536) return;
+    let msg = null;
+    try {
+      msg = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    if (!msg || typeof msg.op !== "string") return;
+    h.pongAt = Date.now();
+    if (msg.op === "hello") {
+      h.ready = true;
+      h.state = "open";
+      h.tries = 0;
+      h.at = 0;
+      hubSync(true);
+      S.dirty = true;
+      paint(true);
+      return;
+    }
+    if (msg.op === "pong") return;
+    if (msg.op === "status") {
+      h.status = msg;
+      h.ready = true;
+      S.dirty = true;
+      paint(false);
+    }
+  });
+
+  ws.addEventListener("close", () => {
+    if (h.ws !== ws) return;
+    hubRetry();
+  });
+
+  ws.addEventListener("error", () => {});
+}
+
+function hubStop() {
+  const h = S.hub;
+  if (h.ws) {
+    try {
+      h.ws.send(JSON.stringify({ op: "off" }));
+    } catch {}
+    try {
+      h.ws.close(1000, "plugin off");
+    } catch {}
+  }
+  h.ws = null;
+  h.state = "idle";
+  h.ready = false;
+  h.status = null;
+  h.syncSig = "";
+  h.pingAt = 0;
+  h.pongAt = 0;
+  h.at = 0;
+}
+
+function hubTick() {
+  const h = S.hub;
+  if (h.ws && h.pongAt && Date.now() - h.pongAt > HUB_PONG) {
+    try {
+      h.ws.close(4000, "hub not answering");
+    } catch {}
+  }
+  if (!h.ws && Date.now() >= h.at) hubConnect();
+  if (h.ws && h.ws.readyState === 1 && Date.now() - h.pingAt >= HUB_PING) {
+    if (hubSend({ op: "ping" })) h.pingAt = Date.now();
   }
 }
 
@@ -371,6 +568,31 @@ function syncRows(force) {
 
 function tick() {
   if (!S.on || S.stop) return;
+
+  S.hubOn = readHub();
+  if (S.hubOn) {
+    hubTick();
+    if (hubActive()) {
+      hubSync(false);
+      // the hub owns every account socket now, so the browser keeps none
+      if (S.rows.size) {
+        for (const r of S.rows.values()) {
+          if (r.ws) {
+            r.closedByUs = true;
+            try {
+              r.ws.close(4000, "hub took over");
+            } catch {}
+          }
+        }
+        S.rows.clear();
+      }
+      S.dirty = true;
+      return;
+    }
+  } else if (S.hub.ws || S.hub.status) {
+    hubStop();
+  }
+
   syncRows();
 
   const tok = tokenNow();
@@ -431,11 +653,32 @@ function resetAll() {
     r.err = "";
     r.phase = r.ws ? r.phase : "idle";
   }
+  const h = S.hub;
+  if (h.ws) {
+    try {
+      h.ws.close(4000, "reconnect all");
+    } catch {}
+  }
+  h.at = 0;
+  h.tries = 0;
+  h.syncSig = "";
   S.dirty = true;
   tick();
 }
 
 function stats() {
+  if (hubActive()) {
+    const h = S.hub.status;
+    const me = h && h.signedIn ? 1 : 0;
+    return {
+      total: (h ? h.total : 0) + me,
+      online: (h ? h.online : 0) + me,
+      connecting: h ? h.connecting : 0,
+      waiting: h ? h.waiting : 0,
+      dead: h ? h.dead : 0,
+      hub: true,
+    };
+  }
   let online = 0;
   let connecting = 0;
   let waiting = 0;
@@ -447,7 +690,7 @@ function stats() {
     else waiting++;
   }
   const me = S.hasCur ? 1 : 0;
-  return { total: S.rows.size + me, online: online + me, connecting, waiting, dead };
+  return { total: S.rows.size + me, online: online + me, connecting, waiting, dead, hub: false };
 }
 
 function applyOn(on, announce) {
@@ -460,6 +703,9 @@ function applyOn(on, announce) {
     S.lastSync = 0;
     S.lastOpen = 0;
     S.misses = 0;
+    S.hub.at = 0;
+    S.hub.tries = 0;
+    S.hub.syncSig = "";
     if (announce) toast("Stay online is on. Accounts connect in the background.", "success");
     tick();
   } else {
@@ -476,6 +722,7 @@ function applyOn(on, announce) {
       r.at = 0;
       r.pingAt = 0;
     }
+    hubStop();
     if (announce) toast("Stay online is off.", "info");
   }
   S.dirty = true;
@@ -540,7 +787,25 @@ function openPanel() {
   again.type = "button";
   again.textContent = "Reconnect all";
   again.addEventListener("click", resetAll);
-  acts.append(toggle, again);
+  const hubBtn = el("button", "so-btn");
+  hubBtn.type = "button";
+  hubBtn.addEventListener("click", () => {
+    const v = !readHub();
+    try {
+      S.api.settings.set("hub", v);
+    } catch {}
+    S.hubOn = v;
+    if (!v) hubStop();
+    else {
+      S.hub.at = 0;
+      S.hub.tries = 0;
+      S.hub.syncSig = "";
+    }
+    S.dirty = true;
+    tick();
+    paint(true);
+  });
+  acts.append(toggle, again, hubBtn);
 
   const f1 = el("div", "so-field");
   const l1 = el("label", null, "Gap between accounts");
@@ -574,17 +839,41 @@ function openPanel() {
   });
   f2.append(l2, i2);
 
+  const f3 = el("div", "so-field");
+  const l3 = el("label", null, "Hub port");
+  const i3 = el("input", "so-in");
+  i3.type = "number";
+  i3.min = String(HUB_PORT_MIN);
+  i3.max = String(HUB_PORT_MAX);
+  i3.step = "1";
+  i3.addEventListener("change", () => {
+    const n = Math.max(HUB_PORT_MIN, Math.min(HUB_PORT_MAX, Number(i3.value) || HUB_PORT_DEF));
+    i3.value = String(n);
+    try {
+      S.api.settings.set("hubport", n);
+    } catch {}
+    if (S.hub.ws) {
+      try {
+        S.hub.ws.close(4000, "port changed");
+      } catch {}
+    }
+    S.hub.at = 0;
+    S.hub.syncSig = "";
+    tick();
+  });
+  f3.append(l3, i3);
+
   const h3 = el("h3", "so-h3", "needs attention");
   const list = el("div", "so-list");
 
-  body.append(sub, hint, acts, f1, f2, h3, list);
+  body.append(sub, hint, acts, f1, f2, f3, h3, list);
   panel.append(head, body);
   root.append(panel);
   document.body.append(root);
 
   S.panel = root;
   S.body = body;
-  S.els = { sub, hint, toggle, i1, i2, list };
+  S.els = { sub, hint, toggle, hubBtn, i1, i2, i3, list };
   paint(true);
 }
 
@@ -607,24 +896,40 @@ function paint(force) {
 
   const st = stats();
   const c = cfg();
-  const head = S.parts > 1 ? "part " + S.part + " of " + S.parts + " · " : "";
-  S.els.sub.textContent =
-    head + st.total + " saved · " + st.online + " online · " + st.connecting + " connecting · " + st.waiting + " waiting" +
-    (st.dead ? " · " + st.dead + " need sign in" : "") +
-    (st.total > c.max ? " · capped at " + c.max : "");
+  if (st.hub) {
+    S.els.sub.textContent =
+      st.total + " saved · " + st.online + " online · " + st.connecting + " connecting · " + st.waiting + " waiting" +
+      (st.dead ? " · " + st.dead + " need sign in" : "") + " · via hub";
+  } else {
+    const head = S.parts > 1 ? "part " + S.part + " of " + S.parts + " · " : "";
+    S.els.sub.textContent =
+      head + st.total + " saved · " + st.online + " online · " + st.connecting + " connecting · " + st.waiting + " waiting" +
+      (st.dead ? " · " + st.dead + " need sign in" : "") +
+      (st.total > c.max ? " · capped at " + c.max : "");
+  }
   S.els.toggle.textContent = S.on ? "Stop" : "Start";
   S.els.toggle.className = "so-btn " + (S.on ? "danger" : "primary");
+  if (S.els.hubBtn) S.els.hubBtn.textContent = S.hubOn ? "Hub: on" : "Hub: off";
   if (document.activeElement !== S.els.i1) S.els.i1.value = String(c.pace);
   if (document.activeElement !== S.els.i2) S.els.i2.value = String(c.max);
+  if (S.els.i3 && document.activeElement !== S.els.i3) S.els.i3.value = String(c.port);
 
   let hintText = "";
   let warn = false;
-  if (!S.total) {
+  if (st.hub) {
+    hintText = "the nexa hub on this machine holds every account, so this browser only keeps the one you are signed in to.";
+    if (st.dead) {
+      warn = true;
+      hintText = st.dead + " accounts need signing in again. open the hub with your browser to see which.";
+    }
+  } else if (!S.total) {
     warn = true;
     hintText = "no saved accounts in this profile. mass accs keeps the list per browser profile, so copy ec.accounts from the profile that has them.";
   } else if (!S.known) {
     warn = true;
     hintText = "this profile is not signed in to a saved account, so it takes the first " + c.max + ". sign in to one of the saved accounts so it knows which part of the list to take.";
+  } else if (S.hubOn && S.hub.state === "absent") {
+    hintText = "the nexa hub is not running, so the accounts are kept online in this browser for now. start the hub and they move over on their own.";
   } else if (S.misses >= 5) {
     warn = true;
     hintText = "this browser could not open " + S.misses + " sockets in a row. close other nexa tabs and apps, or lower accounts per browser.";
@@ -649,6 +954,26 @@ function paint(force) {
   bad.sort((a, b) => Number(b.dead) - Number(a.dead) || b.tries - a.tries);
 
   const frag = document.createDocumentFragment();
+  if (st.hub) {
+    const last = S.hub.status && S.hub.status.last;
+    if (st.dead) {
+      const it = el("div", "so-item");
+      it.append(el("b", null, st.dead + (st.dead === 1 ? " account" : " accounts")), el("span", null, "need signing in again"));
+      frag.append(it);
+      if (last && last.kind === "dead") {
+        const it2 = el("div", "so-item");
+        it2.append(el("b", null, last.id), el("span", null, last.detail));
+        frag.append(it2);
+      }
+    } else if (S.hub.status && S.hub.status.total) {
+      frag.append(el("div", "so-item so-ok", "all good · " + S.hub.status.total + " handled by the hub"));
+    } else {
+      frag.append(el("div", "so-item so-ok", "all good"));
+    }
+    S.els.list.replaceChildren(frag);
+    return;
+  }
+
   for (const r of bad.slice(0, 40)) {
     const it = el("div", "so-item");
     const nm = el("b", null, r.name);
@@ -662,8 +987,8 @@ function paint(force) {
 
 const api = {
   name: "stay online",
-  description: "Keeps every saved account online and splits long lists across browser profiles on its own.",
-  version: "1.2.0",
+  description: "Keeps every saved account online. Uses the local nexa hub when it is running, and keeps them in the browser when it is not.",
+  version: "1.3.0",
   author: "jesus",
   apiVersion: 2,
   permissions: ["stores", "commands.write", "ui.write", "styles.write"],
@@ -674,6 +999,23 @@ const api = {
       type: "toggle",
       default: true,
       description: "Connects every account saved by mass accs in the background. The account you are using stays as it is.",
+    },
+    {
+      key: "hub",
+      label: "Use the local hub",
+      type: "toggle",
+      default: true,
+      description: "When the nexa hub is running on this machine it holds every account socket, so the browser only keeps the account you are signed in to. If it is not running the plugin keeps the accounts online in the browser instead, and moves them over when the hub starts.",
+    },
+    {
+      key: "hubport",
+      label: "Hub port",
+      type: "number",
+      default: 8787,
+      min: 1024,
+      max: 65535,
+      step: 1,
+      description: "The port the local nexa hub listens on. Only change it if you started the hub on another port.",
     },
     {
       key: "pace",
@@ -735,6 +1077,7 @@ const api = {
 
     migrate();
     S.on = readOn();
+    S.hubOn = readHub();
     S.lastOpen = 0;
 
     if (a.settings && typeof a.settings.onChange === "function") {
@@ -742,6 +1085,32 @@ const api = {
         if (typeof v === "boolean") applyOn(v, true);
       });
       if (typeof offOn === "function") S.offs.push(offOn);
+
+      const offHub = a.settings.onChange("hub", (v) => {
+        S.hubOn = !!v;
+        if (!S.hubOn) hubStop();
+        else {
+          S.hub.at = 0;
+          S.hub.tries = 0;
+          S.hub.syncSig = "";
+        }
+        S.dirty = true;
+        tick();
+        paint(true);
+      });
+      if (typeof offHub === "function") S.offs.push(offHub);
+
+      const offPort = a.settings.onChange("hubport", () => {
+        if (S.hub.ws) {
+          try {
+            S.hub.ws.close(4000, "port changed");
+          } catch {}
+        }
+        S.hub.at = 0;
+        S.hub.syncSig = "";
+        tick();
+      });
+      if (typeof offPort === "function") S.offs.push(offPort);
     }
 
     a.commands.register("stayonline", "Keeps every saved account online", (arg) => {
@@ -782,6 +1151,7 @@ const api = {
     if (S.paintT) clearInterval(S.paintT);
     S.timer = null;
     S.paintT = null;
+    hubStop();
     for (const r of S.rows.values()) {
       if (r.ws) {
         r.closedByUs = true;
