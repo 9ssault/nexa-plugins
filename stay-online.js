@@ -4,7 +4,7 @@ const PACE_KEY = "ec.so.pace";
 const MAX_KEY = "ec.so.max";
 const HB_KEY = "ec.so.hb";
 const PACE_DEF = 450;
-const MAX_DEF = 300;
+const MAX_DEF = 400;
 const HB_DEF = 25000;
 const PING_TIMEOUT = 15000;
 const LOGIN_GRACE = 6000;
@@ -26,6 +26,7 @@ const S = {
   offs: [],
   css: null,
   dirty: false,
+  lastSync: 0,
   lastPaint: 0,
   lastErr: "",
   hardLimit: false,
@@ -237,7 +238,10 @@ function openRow(r) {
   S.dirty = true;
 }
 
-function syncRows() {
+function syncRows(force) {
+  const now = Date.now();
+  if (!force && now - S.lastSync < 1500) return;
+  S.lastSync = now;
   const list = readAccounts();
   const cur = curId();
   S.cur = cur;
@@ -316,6 +320,7 @@ function tick() {
 function resetAll() {
   S.pauseUntil = 0;
   S.lastOpen = 0;
+  S.lastSync = 0;
   for (const r of S.rows.values()) {
     r.at = 0;
     r.tries = 0;
@@ -349,6 +354,7 @@ function setOn(v) {
   if (S.on) {
     S.loginAt = 0;
     S.pauseUntil = 0;
+    S.lastSync = 0;
     toast("Stay online is on. Accounts connect in the background.", "success");
     tick();
   } else {
@@ -481,7 +487,8 @@ function paint(force) {
   const c = cfg();
   S.els.sub.textContent =
     st.total + " saved · " + st.online + " online · " + st.connecting + " connecting · " + st.waiting + " waiting" +
-    (st.dead ? " · " + st.dead + " need sign in" : "");
+    (st.dead ? " · " + st.dead + " need sign in" : "") +
+    (st.total > c.max ? " · capped at " + c.max : "");
   S.els.toggle.textContent = S.on ? "Stop" : "Start";
   S.els.toggle.className = "so-btn " + (S.on ? "danger" : "primary");
   if (document.activeElement !== S.els.i1) S.els.i1.value = String(c.pace);
