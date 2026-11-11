@@ -68,7 +68,7 @@ mass-accounts holds the account list the others read, so load it before the rest
 
 nexa can also install a plugin straight from a url. open the plugin box, pick the option to add one from a link, and paste one of these:
 
-- https://raw.githubusercontent.com/9ssault/nexa-plugins/main/mass-accounts.min.js
+- https://raw.githubusercontent.com/9ssault/nexa-plugins/main/mass-accounts.min.js?v=2.5.1
 - https://raw.githubusercontent.com/9ssault/nexa-plugins/main/toolbox.js
 - https://raw.githubusercontent.com/9ssault/nexa-plugins/main/say.js
 - https://raw.githubusercontent.com/9ssault/nexa-plugins/main/rpc-presence-rotation.js
