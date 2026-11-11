@@ -61,6 +61,20 @@ the switch and the numbers are in nexa's plugin settings, under stay online. the
 
 it reads the same account list mass-accounts saves. this replaces the keep online switch that used to be inside mass-accounts.
 
+### more than 250 accounts
+
+helium is chromium based, so it shares the same websocket limit as every other browser nexa runs in. one browser profile can hold about 255 connections at once. that is the whole profile, not one tab, and a worker does not get around it. stay online keeps 220 accounts per profile by default so the app still has room.
+
+when the saved list is bigger than that, the plugin splits it into chunks of 220 on its own. a profile takes the chunk that contains the account it is signed into. the panel shows the range and names the first account of the next chunk, so a second profile picks up exactly where the first one stopped.
+
+1. open the stay online panel in the first profile. it shows the range, for example `this profile holds accounts 1 to 220 of 320`, and names the account at number 221.
+2. in the first profile's console run `copy(localStorage.getItem("ec.accounts"))` to copy the account list.
+3. make a second browser profile and sign in with the account the panel named.
+4. install mass-accounts there, run `/importcfg`, paste the list and import it. then install stay online.
+5. the second profile takes accounts 221 to 320 on its own. there is nothing to set.
+
+three profiles work the same way, one chunk each. the account you are signed into counts as online in that profile, so a chunk of 220 shows 220 online. if a chunk lands in the wrong place, the panel tells you which account the other profile should use.
+
 ## how to use
 
 open nexa, go to plugins, paste a file in, turn it on.
@@ -75,6 +89,6 @@ nexa can also install a plugin straight from a url. open the plugin box, pick th
 - https://raw.githubusercontent.com/9ssault/nexa-plugins/main/toolbox.js
 - https://raw.githubusercontent.com/9ssault/nexa-plugins/main/say.js
 - https://raw.githubusercontent.com/9ssault/nexa-plugins/main/rpc-presence-rotation.js
-- https://raw.githubusercontent.com/9ssault/nexa-plugins/main/stay-online.js?v=1.1.0
+- https://raw.githubusercontent.com/9ssault/nexa-plugins/main/stay-online.js?v=1.2.0
 
 use the link for mass-accounts, it is a little past what the paste box takes. the other four install fine either way.

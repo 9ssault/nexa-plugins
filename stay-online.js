@@ -6,16 +6,18 @@ const HB_KEY = "ec.so.hb";
 const PACE_DEF = 300;
 const PACE_MIN = 100;
 const PACE_MAX = 5000;
-const MAX_DEF = 400;
+const MAX_DEF = 220;
 const MAX_MIN = 10;
-const MAX_MAX = 1000;
+const MAX_MAX = 240;
+const PARTS_MAX = 8;
 const HB_DEF = 25000;
 const HB_MIN = 10000;
 const HB_MAX = 60000;
 const GRACE_DEF = 6000;
 const GRACE_MIN = 500;
 const GRACE_MAX = 30000;
-const PING_TIMEOUT = 15000;
+const PING_TIMEOUT = 90000;
+const CONNECT_TIMEOUT = 15000;
 
 const S = {
   api: null,
@@ -39,6 +41,14 @@ const S = {
   lastPaint: 0,
   lastErr: "",
   hardLimit: false,
+  misses: 0,
+  parts: 1,
+  part: 1,
+  total: 0,
+  start: 0,
+  end: 0,
+  next: null,
+  known: false,
 };
 
 function ls(k, d) {
@@ -164,6 +174,8 @@ function mkRow(a) {
     err: "",
     dead: false,
     closedByUs: false,
+    everOpen: false,
+    startedAt: 0,
   };
 }
 
@@ -186,6 +198,8 @@ function send(ws, obj) {
 
 function openRow(r) {
   r.closedByUs = false;
+  r.everOpen = false;
+  r.startedAt = Date.now();
   let ws;
   try {
     ws = new WebSocket(gatewayUrl());
@@ -209,35 +223,29 @@ function openRow(r) {
     try {
       ws.close(4000, "handshake timeout");
     } catch {}
-  }, PING_TIMEOUT);
+  }, CONNECT_TIMEOUT);
 
   ws.addEventListener("open", () => {
     clearTimeout(guard);
-    r.phase = "open";
+    r.everOpen = true;
+    r.phase = "ready";
+    r.tries = 0;
+    r.crowded = 0;
+    r.at = 0;
+    r.err = "";
     r.lastPing = Date.now();
+    r.pingAt = 0;
+    S.misses = 0;
     if (!send(ws, { op: "identify", d: { token: r.token } })) r.err = "identify failed";
     S.dirty = true;
   });
 
   ws.addEventListener("message", (ev) => {
-    let m;
-    try {
-      m = JSON.parse(typeof ev.data === "string" ? ev.data : "");
-    } catch {
-      return;
-    }
-    if (!m || typeof m !== "object") return;
-    if (m.t === "ready") {
-      r.ready = true;
-      r.phase = "ready";
-      r.tries = 0;
-      r.crowded = 0;
-      r.at = 0;
-      r.err = "";
-      S.dirty = true;
-    } else if (m.t === "heartbeat_ack") {
+    const d = typeof ev.data === "string" ? ev.data : "";
+    if (!d || d.length > 4096) return;
+    if (d.indexOf("heartbeat_ack") >= 0) {
       r.pingAt = 0;
-    } else if (m.t === "session_expired") {
+    } else if (d.indexOf("session_expired") >= 0) {
       r.dead = true;
       r.err = "session expired, sign in again";
       try {
@@ -268,6 +276,18 @@ function openRow(r) {
 
     const code = ev.code || 1006;
     const reason = String(ev.reason || "").toLowerCase();
+
+    if (code === 4001) {
+      r.dead = true;
+      r.err = "session expired, sign in again";
+      r.phase = "dead";
+      r.at = 0;
+      S.dirty = true;
+      return;
+    }
+
+    if (!r.everOpen && code === 1006 && Date.now() - r.startedAt < 3000) S.misses += 1;
+
     let wait;
     if (code === 4009) {
       r.crowded += 1;
@@ -282,9 +302,6 @@ function openRow(r) {
       wait = Math.max(5000, backoff(r));
       S.pauseUntil = Math.max(S.pauseUntil, Date.now() + 5000);
       r.err = "server is full, waiting";
-    } else if (code === 4001) {
-      wait = backoff(r);
-      r.err = "session expired";
     } else {
       wait = backoff(r);
       if (code === 1006) r.err = "connection lost";
@@ -310,11 +327,28 @@ function syncRows(force) {
   S.lastSync = now;
   const list = readAccounts();
   const cur = curId();
+  const c = cfg();
   S.cur = cur;
-  S.hasCur = !!(cur && list.some((a) => a.id === cur));
+
+  const total = list.length;
+  const parts = Math.max(1, Math.min(PARTS_MAX, Math.ceil(total / c.max)));
+  const curIdx = cur ? list.findIndex((a) => a.id === cur) : -1;
+  const part = curIdx >= 0 ? Math.min(parts, Math.floor(curIdx / c.max) + 1) : 1;
+  const start = (part - 1) * c.max;
+  const mine = list.slice(start, start + c.max);
+
+  S.parts = parts;
+  S.part = part;
+  S.total = total;
+  S.start = start;
+  S.end = start + mine.length;
+  S.next = part < parts && list[start + c.max] ? list[start + c.max] : null;
+  S.known = curIdx >= 0;
+
+  S.hasCur = !!(cur && mine.some((a) => a.id === cur));
 
   const keep = new Set();
-  for (const a of list) {
+  for (const a of mine) {
     if (a.id === cur) continue;
     keep.add(a.id);
     const r = S.rows.get(a.id);
@@ -361,7 +395,7 @@ function tick() {
       } catch {}
       continue;
     }
-    if (now - r.lastPing >= c.hb) {
+    if (!r.pingAt && now - r.lastPing >= c.hb) {
       if (!send(ws, { op: "heartbeat" })) continue;
       r.lastPing = now;
       r.pingAt = now;
@@ -388,12 +422,14 @@ function resetAll() {
   S.pauseUntil = 0;
   S.lastOpen = 0;
   S.lastSync = 0;
+  S.misses = 0;
   for (const r of S.rows.values()) {
     r.at = 0;
     r.tries = 0;
     r.crowded = 0;
-    r.err = r.dead ? r.err : "";
-    if (!r.dead) r.phase = r.ws ? r.phase : "idle";
+    r.dead = false;
+    r.err = "";
+    r.phase = r.ws ? r.phase : "idle";
   }
   S.dirty = true;
   tick();
@@ -416,16 +452,14 @@ function stats() {
 
 function applyOn(on, announce) {
   on = !!on;
-  if (S.on === on) {
-    if (announce) toast(on ? "Stay online is already on." : "Stay online is already off.", "info");
-    return;
-  }
+  if (S.on === on) return;
   S.on = on;
   if (on) {
     S.loginAt = 0;
     S.pauseUntil = 0;
     S.lastSync = 0;
     S.lastOpen = 0;
+    S.misses = 0;
     if (announce) toast("Stay online is on. Accounts connect in the background.", "success");
     tick();
   } else {
@@ -467,7 +501,7 @@ function toast(m, t) {
   } catch {}
 }
 
-const CSS = `.so-root{position:fixed;inset:0;z-index:96;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(0,0,0,.6);backdrop-filter:blur(6px)}.so-panel{width:min(620px,100%);max-height:min(84vh,720px);display:flex;flex-direction:column;overflow:hidden;background:var(--bg-floating,#2b2d31);border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.45)}.so-head{display:flex;align-items:center;gap:12px;padding:18px 18px 12px}.so-head h2{margin:0;font-size:19px;font-weight:700;color:var(--text-strong,#f2f3f5);flex:1}.so-x{width:34px;height:34px;display:grid;place-items:center;border:0;border-radius:6px;background:none;color:var(--text-muted,#b5bac1);cursor:pointer;font-size:20px;line-height:1}.so-x:hover{background:rgba(255,255,255,.06);color:var(--text-strong,#f2f3f5)}.so-body{padding:0 18px 18px;overflow-y:auto}.so-sub{margin:0 0 14px;font-size:13px;color:var(--text-muted,#b5bac1)}.so-acts{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}.so-btn{display:inline-flex;align-items:center;gap:7px;border:0;border-radius:7px;padding:9px 14px;font:inherit;font-size:13.5px;font-weight:600;cursor:pointer;background:var(--bg-input,#1e1f22);color:var(--text-strong,#f2f3f5)}.so-btn.primary{background:#3d9e60;color:#fff}.so-btn.danger{background:#da3e44;color:#fff}.so-field{display:flex;align-items:center;gap:10px;margin-bottom:10px}.so-field label{width:130px;font-size:13px;color:var(--text-muted,#b5bac1)}.so-in{width:96px;padding:7px 9px;border-radius:6px;border:1px solid rgba(255,255,255,.1);background:var(--bg-input,#1e1f22);color:var(--text-strong,#f2f3f5);font:inherit;font-size:13px}.so-h3{margin:18px 0 8px;font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--text-muted,#b5bac1)}.so-list{display:flex;flex-direction:column;gap:6px;max-height:220px;overflow-y:auto}.so-item{display:flex;gap:10px;align-items:baseline;padding:7px 10px;border-radius:6px;background:rgba(255,255,255,.03);font-size:12.5px}.so-item b{color:var(--text-strong,#f2f3f5);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:45%}.so-item span{color:var(--text-muted,#b5bac1)}.so-ok{color:#3d9e60}`;
+const CSS = `.so-root{position:fixed;inset:0;z-index:96;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(0,0,0,.6);backdrop-filter:blur(6px)}.so-panel{width:min(620px,100%);max-height:min(84vh,720px);display:flex;flex-direction:column;overflow:hidden;background:var(--bg-floating,#2b2d31);border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.45)}.so-head{display:flex;align-items:center;gap:12px;padding:18px 18px 12px}.so-head h2{margin:0;font-size:19px;font-weight:700;color:var(--text-strong,#f2f3f5);flex:1}.so-x{width:34px;height:34px;display:grid;place-items:center;border:0;border-radius:6px;background:none;color:var(--text-muted,#b5bac1);cursor:pointer;font-size:20px;line-height:1}.so-x:hover{background:rgba(255,255,255,.06);color:var(--text-strong,#f2f3f5)}.so-body{padding:0 18px 18px;overflow-y:auto}.so-sub{margin:0 0 14px;font-size:13px;color:var(--text-muted,#b5bac1)}.so-acts{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}.so-btn{display:inline-flex;align-items:center;gap:7px;border:0;border-radius:7px;padding:9px 14px;font:inherit;font-size:13.5px;font-weight:600;cursor:pointer;background:var(--bg-input,#1e1f22);color:var(--text-strong,#f2f3f5)}.so-btn.primary{background:#3d9e60;color:#fff}.so-btn.danger{background:#da3e44;color:#fff}.so-field{display:flex;align-items:center;gap:10px;margin-bottom:10px}.so-field label{width:130px;font-size:13px;color:var(--text-muted,#b5bac1)}.so-in{width:96px;padding:7px 9px;border-radius:6px;border:1px solid rgba(255,255,255,.1);background:var(--bg-input,#1e1f22);color:var(--text-strong,#f2f3f5);font:inherit;font-size:13px}.so-h3{margin:18px 0 8px;font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--text-muted,#b5bac1)}.so-list{display:flex;flex-direction:column;gap:6px;max-height:220px;overflow-y:auto}.so-item{display:flex;gap:10px;align-items:baseline;padding:7px 10px;border-radius:6px;background:rgba(255,255,255,.03);font-size:12.5px}.so-item b{color:var(--text-strong,#f2f3f5);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:45%}.so-item span{color:var(--text-muted,#b5bac1)}.so-ok{color:#3d9e60}.so-warn{color:#f0b232}`;
 
 function el(t, c, x) {
   const n = document.createElement(t);
@@ -496,6 +530,8 @@ function openPanel() {
 
   const body = el("div", "so-body");
   const sub = el("p", "so-sub", "");
+  const hint = el("p", "so-sub so-warn", "");
+  hint.hidden = true;
   const acts = el("div", "so-acts");
   const toggle = el("button", "so-btn primary");
   toggle.type = "button";
@@ -526,8 +562,8 @@ function openPanel() {
   const l2 = el("label", null, "Most sockets open");
   const i2 = el("input", "so-in");
   i2.type = "number";
-  i2.min = "10";
-  i2.max = "1000";
+  i2.min = String(MAX_MIN);
+  i2.max = String(MAX_MAX);
   i2.step = "10";
   i2.addEventListener("change", () => {
     const n = Math.max(MAX_MIN, Math.min(MAX_MAX, Number(i2.value) || MAX_DEF));
@@ -541,14 +577,14 @@ function openPanel() {
   const h3 = el("h3", "so-h3", "needs attention");
   const list = el("div", "so-list");
 
-  body.append(sub, acts, f1, f2, h3, list);
+  body.append(sub, hint, acts, f1, f2, h3, list);
   panel.append(head, body);
   root.append(panel);
   document.body.append(root);
 
   S.panel = root;
   S.body = body;
-  S.els = { sub, toggle, i1, i2, list };
+  S.els = { sub, hint, toggle, i1, i2, list };
   paint(true);
 }
 
@@ -571,14 +607,38 @@ function paint(force) {
 
   const st = stats();
   const c = cfg();
+  const head = S.parts > 1 ? "part " + S.part + " of " + S.parts + " · " : "";
   S.els.sub.textContent =
-    st.total + " saved · " + st.online + " online · " + st.connecting + " connecting · " + st.waiting + " waiting" +
+    head + st.total + " saved · " + st.online + " online · " + st.connecting + " connecting · " + st.waiting + " waiting" +
     (st.dead ? " · " + st.dead + " need sign in" : "") +
     (st.total > c.max ? " · capped at " + c.max : "");
   S.els.toggle.textContent = S.on ? "Stop" : "Start";
   S.els.toggle.className = "so-btn " + (S.on ? "danger" : "primary");
   if (document.activeElement !== S.els.i1) S.els.i1.value = String(c.pace);
   if (document.activeElement !== S.els.i2) S.els.i2.value = String(c.max);
+
+  let hintText = "";
+  let warn = false;
+  if (!S.total) {
+    warn = true;
+    hintText = "no saved accounts in this profile. mass accs keeps the list per browser profile, so copy ec.accounts from the profile that has them.";
+  } else if (!S.known) {
+    warn = true;
+    hintText = "this profile is not signed in to a saved account, so it takes the first " + c.max + ". sign in to one of the saved accounts so it knows which part of the list to take.";
+  } else if (S.misses >= 5) {
+    warn = true;
+    hintText = "this browser could not open " + S.misses + " sockets in a row. close other nexa tabs and apps, or lower accounts per browser.";
+  } else if (S.parts > 1) {
+    hintText = "this profile holds accounts " + (S.start + 1) + " to " + S.end + " of " + S.total + ".";
+    if (S.part > 1) hintText += " the earlier part starts at account 1.";
+    if (S.next) {
+      const nm = S.next.display_name || S.next.username || S.next.id;
+      hintText += " open nexa in another browser profile signed into " + nm + " (number " + (S.end + 1) + ") to bring the rest online.";
+    }
+  }
+  S.els.hint.className = "so-sub" + (warn ? " so-warn" : "");
+  S.els.hint.hidden = !hintText;
+  S.els.hint.textContent = hintText;
 
   const bad = [];
   for (const r of S.rows.values()) {
@@ -602,8 +662,8 @@ function paint(force) {
 
 const api = {
   name: "stay online",
-  description: "Keeps every saved account online, paced so a few hundred accounts do not flood the gateway at login.",
-  version: "1.1.0",
+  description: "Keeps every saved account online and splits long lists across browser profiles on its own.",
+  version: "1.2.0",
   author: "jesus",
   apiVersion: 2,
   permissions: ["stores", "commands.write", "ui.write", "styles.write"],
@@ -627,13 +687,13 @@ const api = {
     },
     {
       key: "max",
-      label: "Most accounts online",
+      label: "Accounts per browser",
       type: "number",
-      default: 400,
+      default: 220,
       min: 10,
-      max: 1000,
+      max: 240,
       step: 10,
-      description: "A hard stop so a very large list cannot lock up the browser.",
+      description: "How many accounts one browser profile keeps online. When the list is longer, the plugin splits it into chunks of this size, one chunk per profile.",
     },
     {
       key: "hb",
@@ -660,6 +720,7 @@ const api = {
   start(a) {
     S.api = a;
     S.stop = false;
+    S.misses = 0;
 
     try {
       S.css = (a.styles && a.styles.add && a.styles.add(CSS)) || null;
