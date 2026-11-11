@@ -71,7 +71,7 @@ so a list bigger than that cannot all run inside one browser. instead of splitti
 you only need the hub when your list is over about 250. under that, the plugin keeps the accounts online in the browser on its own and you can skip all of this.
 
 1. download the hub: https://raw.githubusercontent.com/9ssault/nexa-plugins/main/nexa-hub.mjs
-2. run it: `node nexa-hub.mjs`. it prints `listening on wss://localhost:8787`. leave it running.
+2. run it: `node nexa-hub.mjs`. it prints `listening on wss://localhost:8787`. leave it running. the hub is not a plugin, so never add it to nexa, neither by pasting it nor as a link. it is a program that runs on your machine next to the browser.
 3. to keep it running, start it however you start background programs. on a linux box with systemd, save this as `~/.config/systemd/user/nexa-hub.service` and run `systemctl --user enable --now nexa-hub`:
 
    ```
@@ -114,5 +114,4 @@ nexa can also install a plugin straight from a url. open the plugin box, pick th
 
 use the link for mass-accounts, it is a little past what the paste box takes. the other four install fine either way.
 
-if you want the accounts held outside the browser, grab the hub too:
-https://raw.githubusercontent.com/9ssault/nexa-plugins/main/nexa-hub.mjs
+every url in that list is a plugin. the hub is not one, so it is not in the list and does not go in the plugin box. if you already added the hub link there, nexa will keep showing `failed to fetch dynamically imported module`, because the hub imports node programs that a browser cannot load. remove that entry from your plugin list. the hub belongs in the stay online section above: download it and run it, that is all.
