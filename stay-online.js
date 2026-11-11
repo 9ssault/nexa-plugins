@@ -3,11 +3,19 @@ const ON_KEY = "ec.so.on";
 const PACE_KEY = "ec.so.pace";
 const MAX_KEY = "ec.so.max";
 const HB_KEY = "ec.so.hb";
-const PACE_DEF = 450;
+const PACE_DEF = 300;
+const PACE_MIN = 100;
+const PACE_MAX = 5000;
 const MAX_DEF = 400;
+const MAX_MIN = 10;
+const MAX_MAX = 1000;
 const HB_DEF = 25000;
+const HB_MIN = 10000;
+const HB_MAX = 60000;
+const GRACE_DEF = 6000;
+const GRACE_MIN = 500;
+const GRACE_MAX = 30000;
 const PING_TIMEOUT = 15000;
-const LOGIN_GRACE = 6000;
 
 const S = {
   api: null,
@@ -17,6 +25,7 @@ const S = {
   paintT: null,
   rows: new Map(),
   cur: null,
+  hasCur: false,
   lastOpen: 0,
   pauseUntil: 0,
   loginAt: 0,
@@ -41,18 +50,60 @@ function ls(k, d) {
   }
 }
 
-function num(k, d, lo, hi) {
-  const n = Number(ls(k, ""));
-  if (!Number.isFinite(n) || n <= 0) return d;
-  return Math.max(lo, Math.min(hi, Math.round(n)));
+function sNum(key, fallback, lo, hi) {
+  let v;
+  try {
+    v = S.api?.settings?.get?.(key);
+  } catch {}
+  if (typeof v !== "number" || !Number.isFinite(v)) v = Number(ls("ec.so." + key, ""));
+  if (!Number.isFinite(v) || v <= 0) v = fallback;
+  return Math.max(lo, Math.min(hi, Math.round(v)));
 }
 
 function cfg() {
   return {
-    pace: num(PACE_KEY, PACE_DEF, 100, 5000),
-    max: num(MAX_KEY, MAX_DEF, 10, 1000),
-    hb: num(HB_KEY, HB_DEF, 10000, 60000),
+    pace: sNum("pace", PACE_DEF, PACE_MIN, PACE_MAX),
+    max: sNum("max", MAX_DEF, MAX_MIN, MAX_MAX),
+    hb: sNum("hb", HB_DEF, HB_MIN, HB_MAX),
+    grace: sNum("grace", GRACE_DEF, GRACE_MIN, GRACE_MAX),
   };
+}
+
+function readOn() {
+  try {
+    const v = S.api?.settings?.get?.("on");
+    if (typeof v === "boolean") return v;
+  } catch {}
+  return ls(ON_KEY, "1") !== "0";
+}
+
+function migrate() {
+  if (!S.api?.settings?.set) return;
+  const old = [
+    [ON_KEY, "on", (x) => (x === "1" ? true : x === "0" ? false : null)],
+    [PACE_KEY, "pace", Number],
+    [MAX_KEY, "max", Number],
+    [HB_KEY, "hb", Number],
+  ];
+  for (const [key, name, cast] of old) {
+    let raw = null;
+    try {
+      raw = localStorage.getItem(key);
+    } catch {}
+    if (raw === null) continue;
+    let value = null;
+    try {
+      value = cast(raw);
+    } catch {}
+    if (value !== null && (typeof value === "boolean" || (Number.isFinite(value) && value > 0))) {
+      try {
+        S.api.settings.set(name, value);
+      } catch {}
+    }
+    try {
+      localStorage.removeItem(key);
+    } catch {}
+  }
 }
 
 function readAccounts() {
@@ -112,6 +163,7 @@ function mkRow(a) {
     ready: false,
     err: "",
     dead: false,
+    closedByUs: false,
   };
 }
 
@@ -133,6 +185,7 @@ function send(ws, obj) {
 }
 
 function openRow(r) {
+  r.closedByUs = false;
   let ws;
   try {
     ws = new WebSocket(gatewayUrl());
@@ -200,6 +253,13 @@ function openRow(r) {
     r.ready = false;
     r.pingAt = 0;
 
+    if (r.closedByUs) {
+      r.closedByUs = false;
+      r.phase = r.dead ? "dead" : "idle";
+      S.dirty = true;
+      return;
+    }
+
     if (!S.on || S.stop || r.dead) {
       r.phase = r.dead ? "dead" : "idle";
       S.dirty = true;
@@ -207,15 +267,21 @@ function openRow(r) {
     }
 
     const code = ev.code || 1006;
+    const reason = String(ev.reason || "").toLowerCase();
     let wait;
     if (code === 4009) {
       r.crowded += 1;
       wait = Math.min(300000, 30000 * Math.pow(2, Math.min(r.crowded - 1, 4))) + Math.random() * 5000;
-      S.pauseUntil = Math.max(S.pauseUntil, Date.now() + 8000);
-      r.err = "gateway is crowded, backing off";
+      if (reason.indexOf("network") >= 0) {
+        r.err = "network limit, backing off";
+        S.pauseUntil = Math.max(S.pauseUntil, Date.now() + 20000);
+      } else {
+        r.err = "already open in another tab or app";
+      }
     } else if (code === 4008) {
       wait = Math.max(5000, backoff(r));
-      r.err = "rate limited";
+      S.pauseUntil = Math.max(S.pauseUntil, Date.now() + 5000);
+      r.err = "server is full, waiting";
     } else if (code === 4001) {
       wait = backoff(r);
       r.err = "session expired";
@@ -245,6 +311,7 @@ function syncRows(force) {
   const list = readAccounts();
   const cur = curId();
   S.cur = cur;
+  S.hasCur = !!(cur && list.some((a) => a.id === cur));
 
   const keep = new Set();
   for (const a of list) {
@@ -278,7 +345,7 @@ function tick() {
     return;
   }
   const now = Date.now();
-  if (!S.loginAt) S.loginAt = now + LOGIN_GRACE;
+  if (!S.loginAt) S.loginAt = now + cfg().grace;
   if (now < S.loginAt) return;
 
   const c = cfg();
@@ -343,35 +410,54 @@ function stats() {
     else if (r.dead) dead++;
     else waiting++;
   }
-  return { total: S.rows.size, online, connecting, waiting, dead };
+  const me = S.hasCur ? 1 : 0;
+  return { total: S.rows.size + me, online: online + me, connecting, waiting, dead };
 }
 
-function setOn(v) {
-  S.on = !!v;
-  try {
-    localStorage.setItem(ON_KEY, S.on ? "1" : "0");
-  } catch {}
-  if (S.on) {
+function applyOn(on, announce) {
+  on = !!on;
+  if (S.on === on) {
+    if (announce) toast(on ? "Stay online is already on." : "Stay online is already off.", "info");
+    return;
+  }
+  S.on = on;
+  if (on) {
     S.loginAt = 0;
     S.pauseUntil = 0;
     S.lastSync = 0;
-    toast("Stay online is on. Accounts connect in the background.", "success");
+    S.lastOpen = 0;
+    if (announce) toast("Stay online is on. Accounts connect in the background.", "success");
     tick();
   } else {
     for (const r of S.rows.values()) {
-      try {
-        r.ws?.close(4000, "stopped");
-      } catch {}
+      if (r.ws) {
+        r.closedByUs = true;
+        try {
+          r.ws.close(4000, "stopped");
+        } catch {}
+      }
       r.ws = null;
       r.ready = false;
       r.phase = "idle";
       r.at = 0;
       r.pingAt = 0;
     }
-    toast("Stay online is off.", "info");
+    if (announce) toast("Stay online is off.", "info");
   }
   S.dirty = true;
   paint(true);
+}
+
+function setOn(v) {
+  const on = !!v;
+  let saved = false;
+  try {
+    if (S.api?.settings?.set) {
+      S.api.settings.set("on", on);
+      saved = true;
+    }
+  } catch {}
+  if (!saved || S.on !== on) applyOn(on, true);
 }
 
 function toast(m, t) {
@@ -428,10 +514,10 @@ function openPanel() {
   i1.max = "5000";
   i1.step = "50";
   i1.addEventListener("change", () => {
-    const n = Math.max(100, Math.min(5000, Number(i1.value) || PACE_DEF));
+    const n = Math.max(PACE_MIN, Math.min(PACE_MAX, Number(i1.value) || PACE_DEF));
     i1.value = String(n);
     try {
-      localStorage.setItem(PACE_KEY, String(n));
+      S.api.settings.set("pace", n);
     } catch {}
   });
   f1.append(l1, i1, el("span", "so-sub", "ms"));
@@ -444,10 +530,10 @@ function openPanel() {
   i2.max = "1000";
   i2.step = "10";
   i2.addEventListener("change", () => {
-    const n = Math.max(10, Math.min(1000, Number(i2.value) || MAX_DEF));
+    const n = Math.max(MAX_MIN, Math.min(MAX_MAX, Number(i2.value) || MAX_DEF));
     i2.value = String(n);
     try {
-      localStorage.setItem(MAX_KEY, String(n));
+      S.api.settings.set("max", n);
     } catch {}
   });
   f2.append(l2, i2);
@@ -517,10 +603,59 @@ function paint(force) {
 const api = {
   name: "stay online",
   description: "Keeps every saved account online, paced so a few hundred accounts do not flood the gateway at login.",
-  version: "1.0.0",
+  version: "1.1.0",
   author: "jesus",
   apiVersion: 2,
   permissions: ["stores", "commands.write", "ui.write", "styles.write"],
+  settings: [
+    {
+      key: "on",
+      label: "Keep every account online",
+      type: "toggle",
+      default: true,
+      description: "Connects every account saved by mass accs in the background. The account you are using stays as it is.",
+    },
+    {
+      key: "pace",
+      label: "Gap between accounts",
+      type: "number",
+      default: 300,
+      min: 100,
+      max: 5000,
+      step: 50,
+      description: "Milliseconds between two accounts starting. Raise it if the gateway complains.",
+    },
+    {
+      key: "max",
+      label: "Most accounts online",
+      type: "number",
+      default: 400,
+      min: 10,
+      max: 1000,
+      step: 10,
+      description: "A hard stop so a very large list cannot lock up the browser.",
+    },
+    {
+      key: "hb",
+      label: "Heartbeat",
+      type: "number",
+      default: 25000,
+      min: 10000,
+      max: 60000,
+      step: 1000,
+      description: "Milliseconds between keep alive messages on each account.",
+    },
+    {
+      key: "grace",
+      label: "Wait after login",
+      type: "number",
+      default: 6000,
+      min: 500,
+      max: 30000,
+      step: 500,
+      description: "Milliseconds to wait after you sign in before the other accounts start connecting.",
+    },
+  ],
 
   start(a) {
     S.api = a;
@@ -537,8 +672,16 @@ const api = {
       }
     } catch {}
 
-    S.on = ls(ON_KEY, "0") === "1";
-    S.lastOpen = Date.now() + 4000;
+    migrate();
+    S.on = readOn();
+    S.lastOpen = 0;
+
+    if (a.settings && typeof a.settings.onChange === "function") {
+      const offOn = a.settings.onChange("on", (v) => {
+        if (typeof v === "boolean") applyOn(v, true);
+      });
+      if (typeof offOn === "function") S.offs.push(offOn);
+    }
 
     a.commands.register("stayonline", "Keeps every saved account online", (arg) => {
       const v = String(arg || "").trim().toLowerCase();
@@ -579,9 +722,12 @@ const api = {
     S.timer = null;
     S.paintT = null;
     for (const r of S.rows.values()) {
-      try {
-        r.ws?.close(4000, "plugin stopped");
-      } catch {}
+      if (r.ws) {
+        r.closedByUs = true;
+        try {
+          r.ws.close(4000, "plugin stopped");
+        } catch {}
+      }
       r.ws = null;
     }
     S.rows.clear();

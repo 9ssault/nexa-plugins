@@ -50,11 +50,14 @@ https://www.last.fm/api/account/create
 
 keeps every saved account online while you use one of them.
 
+- turns itself on when you add it
 - connects the accounts in the background instead of all at once
 - waits for nexa to finish logging you in first
 - sends the gateway heartbeat so the connections stay up
 - backs off when nexa says your network has too many connections
 - tells you which accounts need you to sign in again
+
+the switch and the numbers are in nexa's plugin settings, under stay online. the account you are using already counts as online, so you do not lose a slot to it.
 
 it reads the same account list mass-accounts saves. this replaces the keep online switch that used to be inside mass-accounts.
 
@@ -72,6 +75,6 @@ nexa can also install a plugin straight from a url. open the plugin box, pick th
 - https://raw.githubusercontent.com/9ssault/nexa-plugins/main/toolbox.js
 - https://raw.githubusercontent.com/9ssault/nexa-plugins/main/say.js
 - https://raw.githubusercontent.com/9ssault/nexa-plugins/main/rpc-presence-rotation.js
-- https://raw.githubusercontent.com/9ssault/nexa-plugins/main/stay-online.js
+- https://raw.githubusercontent.com/9ssault/nexa-plugins/main/stay-online.js?v=1.1.0
 
 use the link for mass-accounts, it is a little past what the paste box takes. the other four install fine either way.
